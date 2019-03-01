@@ -1,0 +1,9 @@
+[package]
+name = "tcp-lb"
+version = "1.0.0"
+
+[dependencies]
+log = "0.4.6"
+argparse = "0.2.2"
+mio = "0.4.4"
+env_logger = "0.6.0"
