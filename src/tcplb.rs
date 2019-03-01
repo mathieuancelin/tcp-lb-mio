@@ -1,14 +1,21 @@
 extern crate mio;
 
 use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mio::*;
-use mio::buf::ByteBuf;
+use mio::timer::Timeout;
+use mio::deprecated::*;
+use bytes::ByteBuf;
+use bytes::Buf;
 use mio::tcp::{TcpListener, TcpStream};
-use mio::util::Slab;
+use slab::Slab;
+use slab::VacantEntry;
 
 use std::collections::VecDeque;
 use std::ops::Drop;
@@ -18,7 +25,7 @@ use backend::{RoundRobinBackend, GetBackend};
 const BUFFER_SIZE: usize = 8192;
 const MAX_BUFFERS_PER_CONNECTION: usize = 16;
 const MAX_CONNECTIONS: usize = 512;
-const CONNECT_TIMEOUT_MS: usize = 1000;
+const CONNECT_TIMEOUT_MS: Duration = Duration::from_millis(1000);
 
 pub struct Proxy {
     // socket where incoming connections arrive
@@ -50,7 +57,8 @@ impl Proxy {
             listen_sock: listen_sock,
             token: Token(1),
             backend: backend,
-            connections: Slab::new_starting_at(Token(2), MAX_CONNECTIONS),
+            //connections: Slab::new_starting_at(Token(2), MAX_CONNECTIONS),
+            connections: Slab::with_capacity(MAX_CONNECTIONS), // TODO: fuuuu
             readable_tokens: VecDeque::with_capacity(MAX_CONNECTIONS),
         }
     }
@@ -61,8 +69,8 @@ impl Proxy {
     /// from the event_loop.
     fn push_to_readable_tokens(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
         self.readable_tokens.push_back(token);
-        self.connections[token].interest.remove(EventSet::readable());
-        self.connections[token].reregister(event_loop).unwrap();
+        self.connections[token.0].interest.remove(Ready::readable());
+        self.connections[token.0].reregister(event_loop).unwrap();
     }
 
     /// Read as much as it can of a token
@@ -70,7 +78,7 @@ impl Proxy {
     /// Stops when we read everything the kernel had for us or the other end send
     /// queue is full.
     fn read_token(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) -> io::Result<bool> {
-        let other_end_token = match self.connections[token].end_token {
+        let other_end_token = match self.connections[token.0].end_token {
             Some(other_end_token) => other_end_token,
             None => {
                 warn!("Attempting to read a token with no other end");
@@ -78,7 +86,7 @@ impl Proxy {
             }
         };
         let buffers_to_read = MAX_BUFFERS_PER_CONNECTION -
-                              self.connections[other_end_token].send_queue.len();
+                              self.connections[other_end_token.0].send_queue.len();
         let (exhausted_kernel, messages) = try!(self.find_connection_by_token(token)
                                                     .read(buffers_to_read));
         // let's not tell we have something to write if we don't
@@ -86,16 +94,16 @@ impl Proxy {
             return Ok(exhausted_kernel);
         }
 
-        self.connections[other_end_token]
+        self.connections[other_end_token.0]
             .send_messages(messages)
             .and_then(|_| {
-                self.connections[other_end_token].interest.insert(EventSet::writable());
-                self.connections[other_end_token].reregister(event_loop)
+                self.connections[other_end_token.0].interest.insert(Ready::writable());
+                self.connections[other_end_token.0].reregister(event_loop)
             })
             .unwrap_or_else(|e| {
                 error!("Failed to queue message for {:?}: {:?}", other_end_token, e);
             });
-        self.connections[token].reregister(event_loop).unwrap();
+        self.connections[token.0].reregister(event_loop).unwrap();
         Ok(exhausted_kernel)
     }
 
@@ -110,8 +118,8 @@ impl Proxy {
                     match self.read_token(event_loop, token) {
                         Ok(exhausted_kernel) => {
                             if exhausted_kernel {
-                                self.connections[token].interest.insert(EventSet::readable());
-                                self.connections[token].reregister(event_loop).unwrap();
+                                self.connections[token.0].interest.insert(Ready::readable());
+                                self.connections[token.0].reregister(event_loop).unwrap();
                             } else {
                                 self.readable_tokens.push_back(token);
                             }
@@ -132,9 +140,9 @@ impl Proxy {
     /// We assume that getting a write event means the TCP connection
     /// phase is finished.
     fn handle_write_event(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
-        if !self.connections[token].connected {
-            self.connections[token].connected = true;
-            match self.connections[token].sock.peer_addr() {
+        if !self.connections[token.0].connected {
+            self.connections[token.0].connected = true;
+            match self.connections[token.0].sock.peer_addr() {
                 Ok(addr) => debug!("Connected to backend server {}", addr),
                 Err(_) => warn!("Connected to unknonw backend server, this is odd"),
             }
@@ -146,22 +154,22 @@ impl Proxy {
     ///
     /// Drop the connection if we sent everything and other end is gone
     fn flush_send_queue(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
-        match self.connections[token].write() {
+        match self.connections[token.0].write() {
             Ok(flushed_everything) => {
                 if flushed_everything {
-                    self.connections[token].interest.remove(EventSet::writable());
-                    self.connections[token].reregister(event_loop).unwrap();
+                    self.connections[token.0].interest.remove(Ready::writable());
+                    self.connections[token.0].reregister(event_loop).unwrap();
                 }
             }
             Err(_) => {
                 error!("Could not write on {:?}, dropping send queue", token);
-                self.connections[token].send_queue.clear();
+                self.connections[token.0].send_queue.clear();
             }
         }
 
         // Terminate connection if other end is gone and send queue if flushed
-        if self.connections[token].send_queue.is_empty() &&
-           self.connections[token].end_token.is_none() {
+        if self.connections[token.0].send_queue.is_empty() &&
+           self.connections[token.0].end_token.is_none() {
             self.terminate_connection(event_loop, token);
         }
     }
@@ -184,14 +192,8 @@ impl Proxy {
     /// false when no more connection to accept or error happened.
     fn accept_one(&mut self, event_loop: &mut EventLoop<Proxy>) -> bool {
         let client_sock = match self.listen_sock.accept() {
-            Ok(s) => {
-                match s {
-                    Some(sock) => sock,
-                    None => {
-                        debug!("No more socket to accept on this event");
-                        return false;
-                    }
-                }
+            Ok((stream, socket)) => {
+                stream
             }
             Err(e) => {
                 error!("Failed to accept new socket, {:?}", e);
@@ -219,14 +221,14 @@ impl Proxy {
                     Some(backend_token) => {
                         self.link_connections_together(client_token, backend_token, event_loop);
                         // Register a timeout on the backend server socket
-                        let timeout = event_loop.timeout_ms(backend_token.as_usize(),
-                                                            CONNECT_TIMEOUT_MS as u64)
+                        let timeout = event_loop.timeout(backend_token.0,
+                                                            CONNECT_TIMEOUT_MS)
                                                 .unwrap();
-                        self.connections[backend_token].timeout = Some(timeout);
+                        self.connections[backend_token.0].timeout = Some(timeout);
                     }
                     None => {
                         error!("Cannot create backend Connection, dropping client");
-                        self.connections.remove(client_token);
+                        self.connections.remove(client_token.0);
                         return false;
                     }
                 }
@@ -235,7 +237,7 @@ impl Proxy {
                 match backend_token {
                     Some(backend_token) => {
                         error!("Cannot create client Connection, dropping backend");
-                        self.connections.remove(backend_token);
+                        self.connections.remove(backend_token.0);
                         return false;
                     }
                     None => {
@@ -262,12 +264,24 @@ impl Proxy {
                                    already_connected: bool,
                                    event_loop: &mut EventLoop<Proxy>)
                                    -> Option<Token> {
-        self.connections.insert_with(|token| {
+        let entry: VacantEntry<Connection> = self.connections.vacant_entry();
+        let idx: usize = entry.key();
+        let fun = |token| {
             debug!("Creating Connection with {:?}", token);
             let mut connection = Connection::new(sock, token, already_connected);
             connection.register(event_loop).unwrap();
             connection
-        })
+        };
+        let conn: Connection = fun(Token(idx));
+        entry.insert(conn);
+        //let token = &*_token;
+        Some(Token(idx))                   
+        //self.connections.insert_with(|token| {
+        //    debug!("Creating Connection with {:?}", token);
+        //    let mut connection = Connection::new(sock, token, already_connected);
+        //    connection.register(event_loop).unwrap();
+        //    connection
+        //})
     }
 
     /// Link two Connection together
@@ -279,15 +293,15 @@ impl Proxy {
                                  client_token: Token,
                                  backend_token: Token,
                                  event_loop: &mut EventLoop<Proxy>) {
-        self.connections[client_token].end_token = Some(backend_token);
-        self.connections[backend_token].end_token = Some(client_token);
+        self.connections[client_token.0].end_token = Some(backend_token);
+        self.connections[backend_token.0].end_token = Some(client_token);
         // Now that we have two Connections linked with each other
         // we can register to Read events.
-        self.connections[client_token].interest.insert(EventSet::readable());
-        self.connections[backend_token].interest.insert(EventSet::readable());
-        self.connections[backend_token].interest.insert(EventSet::writable());
-        self.connections[client_token].reregister(event_loop).unwrap();
-        self.connections[backend_token].reregister(event_loop).unwrap();
+        self.connections[client_token.0].interest.insert(Ready::readable());
+        self.connections[backend_token.0].interest.insert(Ready::readable());
+        self.connections[backend_token.0].interest.insert(Ready::writable());
+        self.connections[client_token.0].reregister(event_loop).unwrap();
+        self.connections[backend_token.0].reregister(event_loop).unwrap();
     }
 
     /// Terminate a connection as well as its other end
@@ -295,13 +309,13 @@ impl Proxy {
     /// Makes sure to flush all pending queues before dropping the other end
     /// of a connection.
     fn terminate_connection(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
-        if !self.connections.contains(token) {
+        if !self.connections.contains(token.0) {
             warn!("Attempting to terminate an already gone connection");
             return;
         }
-        match self.connections[token].end_token {
+        match self.connections[token.0].end_token {
             Some(end_token) => {
-                if self.connections[end_token].send_queue.is_empty() {
+                if self.connections[end_token.0].send_queue.is_empty() {
                     // Nothing to write on the other end, we can drop it
                     self.destroy_connection(event_loop, end_token);
                 } else {
@@ -309,10 +323,10 @@ impl Proxy {
                     // just stop reading it and we will terminate it
                     // when we flushed its send_queue
                     // Todo: Is there a way to schedule a timeout?
-                    self.connections[end_token].end_token = None;
-                    self.connections[end_token].interest.remove(EventSet::readable());
-                    self.connections[end_token].interest.insert(EventSet::writable());
-                    self.connections[end_token].reregister(event_loop).unwrap();
+                    self.connections[end_token.0].end_token = None;
+                    self.connections[end_token.0].interest.remove(Ready::readable());
+                    self.connections[end_token.0].interest.insert(Ready::writable());
+                    self.connections[end_token.0].reregister(event_loop).unwrap();
                 }
             }
             None => {}
@@ -325,35 +339,35 @@ impl Proxy {
     /// While terminate_connection() handles corner cases, this method does not, it
     /// only cleans and drops.
     fn destroy_connection(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
-        match self.connections[token].timeout {
+        match self.connections[token.0].timeout {
             Some(timeout) => {
-                event_loop.clear_timeout(timeout);
-                self.connections[token].timeout = None;
+                event_loop.clear_timeout(&timeout);
+                self.connections[token.0].timeout = None;
             }
             None => {}
         }
-        self.connections[token].deregister(event_loop).unwrap();
-        self.connections.remove(token);
+        self.connections[token.0].deregister(event_loop).unwrap();
+        self.connections.remove(token.0);
     }
 
     /// Find a connection in the slab using the given token.
     fn find_connection_by_token<'a>(&'a mut self, token: Token) -> &'a mut Connection {
-        &mut self.connections[token]
+        &mut self.connections[token.0]
     }
 
     /// Try to connect to the next backend server
     ///
     /// Resets the timeout to prevent multiple timeouts to be set concurrently.
     fn try_next_server(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
-        match self.connections[token].timeout {
+        match self.connections[token.0].timeout {
             Some(timeout) => {
-                event_loop.clear_timeout(timeout);
-                self.connections[token].timeout = None;
+                event_loop.clear_timeout(&timeout);
+                self.connections[token.0].timeout = None;
             }
             None => {}
         }
-        self.connections[token].deregister(event_loop).unwrap();
-        self.connections[token].sock = match self.connect_to_backend_server() {
+        self.connections[token.0].deregister(event_loop).unwrap();
+        self.connections[token.0].sock = match self.connect_to_backend_server() {
             Ok(backend_sock) => {
                 backend_sock
             }
@@ -363,12 +377,12 @@ impl Proxy {
                 return;
             }
         };
-        self.connections[token].register(event_loop).unwrap();
+        self.connections[token.0].register(event_loop).unwrap();
         // Register another timeout on the backend server socket
         // in case the new backend server is also unavailable
-        let timeout = event_loop.timeout_ms(token.as_usize(), CONNECT_TIMEOUT_MS as u64)
+        let timeout = event_loop.timeout(token.0, CONNECT_TIMEOUT_MS)
                                 .unwrap();
-        self.connections[token].timeout = Some(timeout);
+        self.connections[token.0].timeout = Some(timeout);
     }
 }
 
@@ -381,14 +395,14 @@ impl Handler for Proxy {
     /// Only used for backend server connection timeout
     fn timeout(&mut self, event_loop: &mut EventLoop<Proxy>, timeout: usize) {
         let token = Token(timeout);
-        if self.connections.contains(token) && !self.connections[token].connected {
+        if self.connections.contains(token.0) && !self.connections[token.0].connected {
             warn!("Connect to backend server timeout");
             self.try_next_server(event_loop, token);
         }
     }
 
     /// Method called when a event from the event loop is notified
-    fn ready(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token, events: EventSet) {
+    fn ready(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token, events: Ready) {
         debug!("events [{:?}] on {:?}", events, token);
 
         // we are only interested in read events from the listening token
@@ -396,18 +410,18 @@ impl Handler for Proxy {
         if token == self.token {
             self.accept(event_loop);
             debug!("Accepted connection(s), now {} Connections",
-                  self.connections.count());
+                  self.connections.len());
             return;
         }
 
-        if !self.connections.contains(token) {
+        if !self.connections.contains(token.0) {
             warn!("Got an event on a gone token");
             return;
         }
 
         if events.is_error() {
             debug!("Got an error on {:?}", token);
-            if !self.connections[token].connected {
+            if !self.connections[token.0].connected {
                 // Got an error while connecting to a backend server?
                 // Let's try the next one.
                 warn!("Connect to backend server failed");
@@ -441,7 +455,7 @@ impl Handler for Proxy {
         self.flush_readable_tokens(event_loop);
 
         debug!("Finished loop with {} Connections and {} readable tokens",
-               self.connections.count(),
+               self.connections.len(),
                self.readable_tokens.len());
 
     }
@@ -455,7 +469,7 @@ struct Connection {
     token: Token,
 
     // set of events we are interested in
-    interest: EventSet,
+    interest: Ready,
 
     // messages waiting to be sent out to sock
     send_queue: VecDeque<ByteBuf>,
@@ -467,7 +481,7 @@ struct Connection {
     connected: bool,
 
     // store timeout when connecting to a server backend
-    timeout: Option<mio::Timeout>,
+    timeout: Option<mio::timer::Timeout>,
 }
 
 impl Drop for Connection {
@@ -486,7 +500,7 @@ impl Connection {
             // they are first created. We always want to make sure we are
             // listening for the hang up event. We will additionally listen
             // for readable and writable events later on.
-            interest: EventSet::hup() | EventSet::error(),
+            interest: Ready::hup() | Ready::error(),
 
             send_queue: VecDeque::with_capacity(MAX_BUFFERS_PER_CONNECTION),
 
@@ -513,15 +527,15 @@ impl Connection {
 
         for _ in 0..nb_buffers {
             let mut recv_buf = ByteBuf::mut_with_capacity(BUFFER_SIZE);
-            match self.sock.try_read_buf(&mut recv_buf) {
+            match self.sock.read(&mut recv_buf.bytes()) {
                 // the socket receive buffer is empty, so let's move on
                 // try_read_buf internally handles WouldBlock here too
-                Ok(None) => {
-                    debug!("CONN : we read 0 bytes, exhausted kernel");
-                    exhausted_kernel = true;
-                    break;
-                }
-                Ok(Some(n)) => {
+                // Ok(None) => {
+                //     debug!("CONN : we read 0 bytes, exhausted kernel");
+                //     exhausted_kernel = true;
+                //     break;
+                // }
+                Ok(n) => {
                     debug!("CONN : we read {} bytes", n);
                     if n == 0 {
                         // Reading on a closed socket never gives Ok(None)...
@@ -570,16 +584,17 @@ impl Connection {
         self.send_queue
             .pop_front()
             .ok_or(io::Error::new(io::ErrorKind::Other, "Could not pop send queue"))
-            .and_then(|mut buf| {
-                match self.sock.try_write_buf(&mut buf) {
-                    Ok(None) => {
-                        debug!("client flushing buf; WouldBlock");
-
-                        // put message back into the queue so we can try again
-                        self.send_queue.push_front(buf);
-                        Ok(false)
-                    }
-                    Ok(Some(n)) => {
+            .and_then(|mut buf: ByteBuf| {
+                let data: Result<Vec<_>, _> = buf.bytes().collect();
+                let data = data.expect("Unable to read data");
+                match self.sock.write(&mut data) {
+                    //Ok(None) => {
+                    //    debug!("client flushing buf; WouldBlock");
+                    //    // put message back into the queue so we can try again
+                    //    self.send_queue.push_front(buf);
+                    //    Ok(false)
+                    //}
+                    Ok(n) => {
                         debug!("CONN : we wrote {} bytes", n);
                         if buf.has_remaining() {
                             self.send_queue.push_front(buf);
@@ -604,7 +619,7 @@ impl Connection {
     fn send_messages(&mut self, messages: Vec<ByteBuf>) -> io::Result<()> {
         // Todo: use Vec.append() but not in Rust stable
         self.send_queue.extend(messages.into_iter());
-        self.interest.insert(EventSet::writable());
+        self.interest.insert(Ready::writable());
         Ok(())
     }
 
@@ -613,7 +628,7 @@ impl Connection {
     /// This will let the event loop get notified on events happening on
     /// this connection.
     fn register(&mut self, event_loop: &mut EventLoop<Proxy>) -> io::Result<()> {
-        event_loop.register_opt(&self.sock,
+        event_loop.register(&self.sock,
                                 self.token,
                                 self.interest,
                                 PollOpt::edge() | PollOpt::oneshot())

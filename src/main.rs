@@ -3,6 +3,8 @@ extern crate log;
 extern crate env_logger;
 extern crate argparse;
 extern crate mio;
+extern crate slab;
+extern crate bytes;
 
 mod backend;
 mod tcplb;
@@ -13,6 +15,7 @@ use std::env;
 
 use argparse::{ArgumentParser, Store, Collect};
 use mio::*;
+use mio::deprecated::*;
 
 fn main() {
     let mut servers: Vec<String> = Vec::new();
@@ -49,9 +52,9 @@ fn main() {
 
     let mut proxy = tcplb::Proxy::new(&bind, backend.clone());
     let mut event_loop = EventLoop::new().unwrap();
-    event_loop.register_opt(&proxy.listen_sock,
+    event_loop.register(&proxy.listen_sock,
                             Token(1),
-                            EventSet::readable(),
+                            Ready::readable(),
                             PollOpt::edge()).unwrap();
 
     event_loop.run(&mut proxy).unwrap();
