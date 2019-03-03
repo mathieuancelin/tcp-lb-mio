@@ -340,7 +340,7 @@ impl Proxy {
     /// only cleans and drops.
     fn destroy_connection(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
         match self.connections[token.0].timeout {
-            Some(timeout) => {
+            Some(ref timeout) => {
                 event_loop.clear_timeout(&timeout);
                 self.connections[token.0].timeout = None;
             }
@@ -360,7 +360,7 @@ impl Proxy {
     /// Resets the timeout to prevent multiple timeouts to be set concurrently.
     fn try_next_server(&mut self, event_loop: &mut EventLoop<Proxy>, token: Token) {
         match self.connections[token.0].timeout {
-            Some(timeout) => {
+            Some(ref timeout) => {
                 event_loop.clear_timeout(&timeout);
                 self.connections[token.0].timeout = None;
             }
@@ -585,8 +585,8 @@ impl Connection {
             .pop_front()
             .ok_or(io::Error::new(io::ErrorKind::Other, "Could not pop send queue"))
             .and_then(|mut buf: ByteBuf| {
-                let data: Result<Vec<_>, _> = buf.bytes().collect();
-                let data = data.expect("Unable to read data");
+                let d1: Result<Vec<_>, _> = buf.bytes().collect();
+                let mut data = d1.expect("Unable to read data");
                 match self.sock.write(&mut data) {
                     //Ok(None) => {
                     //    debug!("client flushing buf; WouldBlock");
